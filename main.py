@@ -44,11 +44,11 @@ def preinit():
 def loadDatasets(train=True, startToken="<|startoftext|>", endToken="<|endoftext|>"):
     #we want to load the english and german datasets
     if train:
-        engpath = os.path.join(os.getcwd(), "flores200_dataset", "flores200_dataset", "dev", "eng_Latn.dev")
-        germanPath = os.path.join(os.getcwd(), "flores200_dataset", "flores200_dataset", "dev", "deu_Latn.dev")
+        engpath = os.path.join(os.getcwd(), "flores200_dataset", "dev", "eng_Latn.dev")
+        germanPath = os.path.join(os.getcwd(), "flores200_dataset", "dev", "deu_Latn.dev")
     else:
-        engpath = os.path.join(os.getcwd(), "flores200_dataset", "flores200_dataset", "devtest", "eng_Latn.dev")
-        germanPath = os.path.join(os.getcwd(), "flores200_dataset", "flores200_dataset", "devtest", "deu_Latn.dev")
+        engpath = os.path.join(os.getcwd(), "flores200_dataset", "devtest", "eng_Latn.dev")
+        germanPath = os.path.join(os.getcwd(), "flores200_dataset", "devtest", "deu_Latn.dev")
     
     #load the datasets
     eng = pandas.read_csv(engpath, sep='\t', header=None)
@@ -141,12 +141,14 @@ def DumpVocabToJSON(vocab, filename):
         json.dump(vocab, f)
         
 
-def AddInitEOSTokensToDataset(dataset, initToken=1, endToken=50256):
+def AddInitEOSTokensToDataset(dataset, tokenizer, initToken=1, endToken=50256):
+    initWord = tokenizer.decode([initToken])
+    endWord = tokenizer.decode([endToken])
     for pair in dataset:
-        pair[0] = pair[0] + initToken
-        pair[1] = pair[1] + initToken
+        pair[0] = pair[0] + initWord
+        pair[1] = pair[1] + initWord
         #pair[0] = pair[0] + endToken
-        pair[1] = pair[1] + endToken
+        pair[1] = pair[1] + endWord
         
     return dataset
 
@@ -213,7 +215,7 @@ class SimpleMultiHeadedAttention(torch.nn.Module):
         self.head_dim = hiddenDim // numHeads
         
         self.dropout = torch.nn.Dropout(dropout)
-        self.fcQ = torch.nn.Linear(hiddenDim, hiddenDim, device=self.device)
+        #self.fcQ = torch.nn.Linear(hiddenDim, hiddenDim, device=self.device)
         self.fcK = torch.nn.Linear(hiddenDim, hiddenDim, device=self.device)
         self.fcV = torch.nn.Linear(hiddenDim, hiddenDim, device=self.device)
         
@@ -222,13 +224,14 @@ class SimpleMultiHeadedAttention(torch.nn.Module):
         
     def forward(self, query, key, value, mask=None):
         batch_size = query.shape[0]
-        print(f"1query shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
+        #print(f"1query shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
+        self.fcQ = torch.nn.Linear(self.hiddenDim, self.hiddenDim, device=self.device)
         Q = self.fcQ(query)
-        print(f"2aquery shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
+        #print(f"2aquery shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
         K = self.fcK(key)
-        print(f"2bquery shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
+        #print(f"2bquery shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
         V = self.fcV(value)
-        print(f"2cquery shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
+        #print(f"2cquery shape: {query.shape}, key shape: {key.shape}, value shape: {value.shape}")
         
         Q = Q.view(batch_size, -1, self.numHeads, self.head_dim).permute(0, 2, 1, 3)
         K = K.view(batch_size, -1, self.numHeads, self.head_dim).permute(0, 2, 1, 3)
@@ -264,7 +267,7 @@ class EncoderLayer(torch.nn.Module):
         #input is a tensor of shape (batch_size, sequenceLength, hidden_dim)
         batch_size = input.shape[0]
         sequenceLength = input.shape[1]
-        print(f"input shape: {input.shape}, inputMask shape: {inputMask.shape}")
+        #print(f"input shape: {input.shape}, inputMask shape: {inputMask.shape}")
         
         #self attention
         _input, _ = self.self_attention(input, input, input, inputMask)
@@ -300,7 +303,7 @@ class Encoder(torch.nn.Module):
         tokenEncoding *= self.scalingFactor
         positionalEncoding = self.positionalEncoding(positons)
         x0 = self.dropout(tokenEncoding + positionalEncoding)
-        print(f"x0 shape: {x0.shape}, mask shape: {mask.shape}")
+        #print(f"x0 shape: {x0.shape}, mask shape: {mask.shape}")
         for layer in self.layers:
             x0 = layer(x0, mask)
         return x0
@@ -424,7 +427,7 @@ def trainModel(model, input, output, optimizer, criterion, device):
         x = data[0].to(device)
         y = data[1].to(device)
         optimizer.zero_grad()
-        print(f"shape of x: {x.shape}, shape of y: {y.shape}")
+        #print(f"shape of x: {x.shape}, shape of y: {y.shape}")
         o, _ = model(x, y[:,:-1])
         o = o.contiguous().view(-1, o.shape[-1])
         y = y[:,1:].contiguous().view(-1)
@@ -460,7 +463,20 @@ def testModel(model, input, output, criterion, device):
     print(f"Testing Epoch took {tend-tstart} seconds")
     return total_loss / len(input)
 
+def shiftTokensByOne(tokens):
+    #shift the tokens by one so that the decoder can predict the next token
+    print(f"Shifting tokens by one")
+    
+    #input in shape (12, 4, tokens)
+    output = tokens.clone()
+    output = output[:, :, 1:]
+    #print(f"output shape: {output.shape}")
+    return output
+
 def inferenceSentance(model, tokenizer, sentance, device, maxLen=64, initToken=1, endToken=50256, batchSize=4, inferenceParams=None):
+    if maxLen == 64:
+        maxLen = inferenceParams["maxLen"]
+    
     print(f"Running inference")
     model.eval()
     sentance = sentance.lower()
@@ -475,10 +491,12 @@ def inferenceSentance(model, tokenizer, sentance, device, maxLen=64, initToken=1
     #    sourceEncoded = sourceEncoded.repeat(batchSize, 1, 1)
     #    inputMask = inputMask.repeat(batchSize, 1, 1, 1)
     predictedTokens = [initToken] 
+    #print(type(maxLen))
     for i in range(maxLen - 1):
+        #print(f"iteration {i+1}/{maxLen}")
        
         targetTensor = torch.tensor(predictedTokens).unsqueeze(0).to(device)
-        print(targetTensor)
+        #print(targetTensor)
         targetMask = model.targetMask(targetTensor)
         #print(targetMask)
         #print(targetMask)
@@ -497,7 +515,7 @@ def inferenceSentance(model, tokenizer, sentance, device, maxLen=64, initToken=1
         
         #get only first batch
         
-        print(f"output shape: {output.shape}")
+        #print(f"output shape: {output.shape}")
         #print(output)
         #output = output[0]
         #batch size, input length, vocab size
@@ -505,30 +523,73 @@ def inferenceSentance(model, tokenizer, sentance, device, maxLen=64, initToken=1
         #predict the most likely token from the output
         #remove 0th possible tokens from the 2nd dimension
         output = output[0, -1, :]
+        #print(output)
         predictions = np.asarray(output.cpu()).astype('float64')
+        #print(predictions)
         predictions = np.exp(np.log(predictions) / inferenceParams["temp"])
+        #print(predictions)
+        
+        
+        #temp patch, replace nan with 0.01
+        numThatIsntNan = 0
+        averageProbs = 0
+        
+        for p in predictions:
+            if not math.isnan(p):
+                numThatIsntNan += 1
+                
+        print(f"numThatIsntNan: {numThatIsntNan}")
+        predictions[np.isnan(predictions)] = 0.01
+        
+        averageProbs = np.sum(predictions[1:]) / len(predictions[1:])
+        print(f"averageProbs: {averageProbs}")
+        
+        #normalize
         predictions = predictions / np.sum(predictions)
         probs = torch.from_numpy(predictions).to(device)
+        #print(probs)
         predicted = torch.multinomial(probs, num_samples=inferenceParams["topk"])
+        print(f"Length of predicted: {len(predicted)}")
+        #remove Nonetype and nan
+        for p in predicted:
+            if p == None or math.isnan(p):
+                predicted.remove(p)
+        
+        
         predicted = random.choice(predicted)
         
         
         #torch.set_printoptions(threshold=10_000)
         #print(output[0])
         
-        print(predicted)
+        #print(predicted)
         #print(predicted.shape)
         #predicted = predicted[-1].item()
         
-        predictedTokens.append(predicted)
-        if predicted == endToken:
+        predictedDecodedToken = None
+        try:
+            predictedDecodedToken = tokenizer.decode([predicted])
+            #print(f"predictedDecodedToken: {predictedDecodedToken}")
+        except:
+            print(f"error decoding token")
+            
+        if predictedDecodedToken != None:
+            predictedTokens.append(predicted)
+        else:
+            predictedTokens.append(0)
+            
+            
+        if predicted == endToken or predictedDecodedToken == inferenceParams["eos"]:
             break 
         
         
         if i % 32 == 0:
+            
             predictedSentance = tokenizer.decode(predictedTokens)
+            predictedSentance = cleanNonReadableText(predictedSentance)
             print(f"Output: {predictedSentance}")
     predictedSentance = tokenizer.decode(predictedTokens)
+    predictedSentance = cleanNonReadableText(predictedSentance)
     print(f"Final output: {predictedSentance}")
     return predictedSentance, attention
 
@@ -559,6 +620,11 @@ def display_attention(sentence, translation, attention, n_heads = 4, n_rows = 1,
 
     plt.show()
     plt.close()
+    
+def cleanNonReadableText(text):
+    cleanText = text.encode('ascii', 'ignore').decode('ascii')
+    cleanText = cleanText.replace("<|endoftext|>", "")
+    return text
 
 
 
@@ -568,26 +634,31 @@ def main():
     PAD_TOKEN = 2
     EOS_TOKEN = 50256
     INIT_TOKEN = 1
-    trainPairs= loadDatasets(True)
-    #only use 50 pairs for now
-    trainPairs = trainPairs[:12*4]
-    print(f"Loaded {len(trainPairs)} pairs")
-    
     model = None
     InferenceOnly = False
     SaveModel = True
+    SaveModelPath = "model.pt"
+    LoadModelPath = "Goodmodel.pt"
     
-    hidden_dim = 256
+    trainPairs= loadDatasets(True)
+    #only use 50 pairs for now
+    trainPairs = trainPairs[:12*8]
+    print(f"Loaded {len(trainPairs)} pairs")
+    
+    
+    
+    hidden_dim = 512
     num_layers = 6
     dropoutEncoder = 0.1
     dropoutDecoder = 0.1
-    num_heads = 4
-    BATCH_SIZE = 4
-    NUM_EPOCHS = 6
+    num_heads = 8
+    BATCH_SIZE = 8
+    NUM_EPOCHS = 2
     tokenizer = Tokenizer()
+    trainPairs = AddInitEOSTokensToDataset(trainPairs, tokenizer, initToken=INIT_TOKEN, endToken=EOS_TOKEN)
+    
     batch_en, batch_de = DatasetToTokens(trainPairs, tokenizer, batch_size=BATCH_SIZE)
-    batch_en = AddInitEOSTokensToDataset(batch_en, initToken=INIT_TOKEN, endToken=EOS_TOKEN)
-    batch_de = AddInitEOSTokensToDataset(batch_de, initToken=INIT_TOKEN, endToken=EOS_TOKEN)
+    batch_de = shiftTokensByOne(batch_de)
     
     batch_en_test, batch_en_train = batch_en[:len(batch_en)//2], batch_en[len(batch_en)//2:]
     batch_de_test, batch_de_train = batch_de[:len(batch_de)//2], batch_de[len(batch_de)//2:]
@@ -614,12 +685,12 @@ def main():
     maxLen = 64
     temp = 0.7
     topk = 8
-    InferenceParams =  {"maxLen": maxLen, "temp": temp, "topk": topk}
+    InferenceParams =  {"maxLen": maxLen, "temp": temp, "topk": topk, "eos": tokenizer.decode([EOS_TOKEN])}
     
     
     if InferenceOnly:
         #load model.pt instead of training
-        model = torch.load("model.pt")
+        model = torch.load(LoadModelPath)
         SaveModel = False
         print("Model loaded from file")        
     else:
@@ -638,19 +709,22 @@ def main():
             print(f"Train Loss: {train_loss}, Test Loss: {test_loss}")
             end = time.time()
             print(f"Epoch took {end-start} seconds")
-            translation, attention = inferenceSentance(model, tokenizer, testPhrase, device, InferenceParams)
+            translation, attention = inferenceSentance(
+        model=model, tokenizer=tokenizer, sentance=testPhrase, device=device, maxLen=maxLen, inferenceParams=InferenceParams)
             print(f"Input: {testPhrase}")
             print(f"Output: {translation}")
         
         #save the model
         if SaveModel:
-            torch.save(model.state_dict(), "model.pt")
+            torch.save(model.state_dict(), SaveModelPath)
             print("Model saved")
         print(f"Train Loss: {train_loss}, Test Loss: {test_loss}")
         print(f"Took {end-start} seconds")
     
     #run final inference
-    translation, attention = inferenceSentance(model, tokenizer, testPhrase, device, InferenceParams)
+    translation, attention = inferenceSentance(
+        model=model, tokenizer=tokenizer, sentance=testPhrase, device=device, maxLen=maxLen, inferenceParams=InferenceParams)
+    translation = cleanNonReadableText(translation)
     print(f"Input: {testPhrase}")
     print(f"Output: {translation}")
     #display_attention(testPhrase, translation, attention)
