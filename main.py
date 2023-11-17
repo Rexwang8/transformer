@@ -277,7 +277,7 @@ class EncoderLayer(torch.nn.Module):
         if DO_IMPROVED_SELF_ATTENTION:
             _input = self.self_attentionLayerNorm(input)
             _input = self.self_attention(_input, _input, _input, inputMask)
-            input = input + self.dropout(_input)
+            input = input + self.dropout(_input[0])
         else:
             _input, _ = self.self_attention(input, input, input, inputMask)
             input = self.self_attentionLayerNorm(input + self.dropout(_input))
@@ -345,7 +345,7 @@ class DecoderLayer(torch.nn.Module):
         if DO_IMPROVED_SELF_ATTENTION:
             _target = self.self_attentionLayerNorm(target)
             _target = self.self_attention(_target, _target, _target, target_mask)
-            target = target + self.dropout(_target)
+            target = target + self.dropout(_target[0])
         else:
             _target, _ = self.self_attention(target, target, target, target_mask)
             target = self.self_attentionLayerNorm(target + self.dropout(_target))
