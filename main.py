@@ -54,6 +54,7 @@ def loadDatasets(train=True, startToken="<|startoftext|>", endToken="<|endoftext
         germanPath = os.path.join(os.getcwd(), "flores200_dataset", "devtest", "deu_Latn.dev")
     
     #load the datasets
+    print(engpath)
     eng = pandas.read_csv(engpath, sep='\t', header=None)
     german = []
     with open(germanPath, 'r', encoding='latin1') as f:
@@ -758,7 +759,7 @@ def calcBLEUWrapper(model, dataset_en, dataset_de, inferenceParams, device):
     return calcBLEU(infResults)
 
 def writePickle(obj, filename):
-    root = 'picklejar'
+    root = 'picklejarStandard'
     if not os.path.exists(root):
         os.makedirs(root)
         
@@ -782,18 +783,18 @@ def main():
     
     trainPairs= loadDatasets(True)
     #only use 50 pairs for now
-    trainPairs = trainPairs[:24*8]
+    trainPairs = trainPairs[:120*8]
     print(f"Loaded {len(trainPairs)} pairs")
     
     global DO_IMPROVED_SELF_ATTENTION
-    DO_IMPROVED_SELF_ATTENTION = False
+    DO_IMPROVED_SELF_ATTENTION = True
     hidden_dim = 512
     num_layers = 6
     dropoutEncoder = 0.1
     dropoutDecoder = 0.1
     num_heads = 8
     BATCH_SIZE = 8
-    NUM_EPOCHS = 10
+    NUM_EPOCHS = 25
     TrainTestFraction = 0.4
     tokenizer = Tokenizer()
     trainPairs = AddInitEOSTokensToDataset(trainPairs, tokenizer, initToken=INIT_TOKEN, endToken=EOS_TOKEN)
