@@ -5,25 +5,25 @@ import pickle
 
 #unpickle loss results
 def unpickleLossResults():
-    with open('transformer/pickles/lossByEpoch.pickle', 'rb') as handle:
+    with open('transformer/picklejarStandard/lossByEpoch.pickle', 'rb') as handle:
         lossResults = pickle.load(handle)
     return lossResults
 
 #unpickle training times
 def unpickleTrainingTimes():
-    with open('transformer/pickles/timeTrainingByEpoch.pickle', 'rb') as handle:
+    with open('transformer/picklejarStandard/timeTrainingByEpoch.pickle', 'rb') as handle:
         trainingTimes = pickle.load(handle)
     return trainingTimes
 
 #unpickle total time
 def unpickleTotalTime():
-    with open('transformer/pickles/totalTime.pickle', 'rb') as handle:
+    with open('transformer/picklejarStandard/totalTime.pickle', 'rb') as handle:
         totalTime = pickle.load(handle)
     return totalTime
 
 #unpickle inference results
 def unpickleInferenceResults():
-    with open('transformer/pickles/inferenceResults.pickle', 'rb') as handle:
+    with open('transformer/picklejarStandard/inferenceResults.pickle', 'rb') as handle:
         inferenceResults = pickle.load(handle)
     return inferenceResults
 
@@ -47,6 +47,7 @@ def plotLossResults(lossResults):
     #title
     plt.title("Loss by Epoch")
     
+    
     plt.savefig('transformer/lossResults.png')
     plt.show()
     
@@ -66,6 +67,7 @@ def plotTrainingTimes(trainingTimes):
     
     #legend
     plt.legend(["Train", "Test"], loc ="upper right")
+    
     
     plt.savefig('transformer/trainingTimes.png')
     plt.show()
