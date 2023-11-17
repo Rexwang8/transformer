@@ -1,3 +1,4 @@
+import pickle
 import time
 from matplotlib import pyplot as plt, ticker
 import torch
@@ -8,7 +9,9 @@ import os
 from transformers import GPT2Tokenizer
 import json
 import random
-
+from deep_translator import GoogleTranslator
+from unidecode import unidecode
+from nltk.translate.bleu_score import corpus_bleu
 def preinit():
     #check if cuda is available
     device = None
@@ -147,7 +150,7 @@ def AddInitEOSTokensToDataset(dataset, tokenizer, initToken=1, endToken=50256):
     for pair in dataset:
         pair[0] = pair[0] + initWord
         pair[1] = pair[1] + initWord
-        #pair[0] = pair[0] + endToken
+        pair[0] = pair[0] + endWord
         pair[1] = pair[1] + endWord
         
     return dataset
@@ -269,9 +272,14 @@ class EncoderLayer(torch.nn.Module):
         sequenceLength = input.shape[1]
         #print(f"input shape: {input.shape}, inputMask shape: {inputMask.shape}")
         
-        #self attention
-        _input, _ = self.self_attention(input, input, input, inputMask)
-        input = self.self_attentionLayerNorm(input + self.dropout(_input))
+        #self attention with potential improved self attention
+        if DO_IMPROVED_SELF_ATTENTION:
+            _input = self.self_attentionLayerNorm(input)
+            _input = self.self_attention(_input, _input, _input, inputMask)
+            input = input + self.dropout(_input)
+        else:
+            _input, _ = self.self_attention(input, input, input, inputMask)
+            input = self.self_attentionLayerNorm(input + self.dropout(_input))
         
         #feed forward
         _input = self.feedforward(input)
@@ -330,8 +338,16 @@ class DecoderLayer(torch.nn.Module):
         sequenceLength = target.shape[1]
         #print(f"target shape: {target.shape}, encoded_input shape: {encoded_input.shape}, input_mask shape: {input_mask.shape}, target_mask shape: {target_mask.shape}")
         #self attention
-        _target, _ = self.self_attention(target, target, target, target_mask)
-        target = self.self_attentionLayerNorm(target + self.dropout(_target))
+        #_target, _ = self.self_attention(target, target, target, target_mask)
+        #target = self.self_attentionLayerNorm(target + self.dropout(_target))
+        #self attention with potential improved self attention
+        if DO_IMPROVED_SELF_ATTENTION:
+            _target = self.self_attentionLayerNorm(target)
+            _target = self.self_attention(_target, _target, _target, target_mask)
+            target = target + self.dropout(_target)
+        else:
+            _target, _ = self.self_attention(target, target, target, target_mask)
+            target = self.self_attentionLayerNorm(target + self.dropout(_target))
         
         #encoder attention
         _target, attention = self.encoder_attention(target, encoded_input, encoded_input, input_mask)
@@ -372,7 +388,32 @@ class Decoder(torch.nn.Module):
             #print(f"3x0 shape: {x0.shape}, encoded_input shape: {encoded_input.shape}, input_mask shape: {input_mask.shape}, target_mask shape: {target_mask.shape}")
             x0, attention = layer(x0, encoded_input, input_mask=input_mask, target_mask=target_mask)
         output = self.linear(x0)
+        #debugPrintOutputFromDecoder(output)
         return output, attention
+    
+def debugPrintOutputFromDecoder(output):
+    print(f"output shape: {output.shape}")
+    output = output[0, -1, 1:]
+    output = torch.softmax(output, dim=0)
+    print(f"new output shape: {output.shape}")
+    tokenizer = Tokenizer()
+    topk = torch.topk(output, 12)
+    stringToPrint = ""
+    for i in range(len(topk[0])):
+        topk[0][i] = topk[0][i] / torch.sum(topk[0])
+    
+    #print(f"Top 10: {topk[0]} {topk[1]}")
+    for i in range(len(topk[0])):
+        index = topk[1][i].item()
+        prob = topk[0][i].item()
+        if index == None:
+            continue
+        try:
+            word = tokenizer.decode(index)
+        except:
+            word = "err"
+        stringToPrint += f"{index}-{word}: {prob:0.4f}, "    
+    print(stringToPrint)
             
 class AttentionTransformer(torch.nn.Module):
     def __init__(self, encoder, decoder, device=None):
@@ -381,7 +422,7 @@ class AttentionTransformer(torch.nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.gptEOS = 50256
-        self.gptPad = 2
+        self.gptPad = 50256
         
     def inputMask(self, input):
         #this mask only hides the padding
@@ -406,8 +447,7 @@ class AttentionTransformer(torch.nn.Module):
         
         encodedInput = self.encoder(input, mask=inputMask)
         output, attention = self.decoder(target, encodedInput, input_mask=inputMask, target_mask=targetMask)
-        return output, attention   
-        
+        return output, attention
 def params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -423,13 +463,16 @@ def trainModel(model, input, output, optimizer, criterion, device):
     i = 0
     tstart = time.time()
     for data in zip(input, output):
-        print(f"Batch {i+1}/{len(input)}")
+        print(f"Batch {i+1}/{len(input)}", end="")
+        tstartBatch = time.time()
         x = data[0].to(device)
         y = data[1].to(device)
         optimizer.zero_grad()
         #print(f"shape of x: {x.shape}, shape of y: {y.shape}")
         o, _ = model(x, y[:,:-1])
         o = o.contiguous().view(-1, o.shape[-1])
+        
+        #shift the target by one so that the decoder can predict the next token
         y = y[:,1:].contiguous().view(-1)
         loss = criterion(o, y)
         loss.backward()
@@ -437,9 +480,8 @@ def trainModel(model, input, output, optimizer, criterion, device):
         optimizer.step()
         total_loss += loss.item()
         i += 1
-        tend = time.time()
-        print(f"Batch took {tend-tstart} seconds")
-        print(f"Batch {i}/{len(input)} loss: {loss.item()}")
+        tendBatch = time.time()
+        print(f" took {tendBatch-tstartBatch} seconds, loss: {loss.item()}")
     tend = time.time()
     print(f"Training Epoch took {tend-tstart} seconds")
     return total_loss / len(input)
@@ -463,15 +505,6 @@ def testModel(model, input, output, criterion, device):
     print(f"Testing Epoch took {tend-tstart} seconds")
     return total_loss / len(input)
 
-def shiftTokensByOne(tokens):
-    #shift the tokens by one so that the decoder can predict the next token
-    print(f"Shifting tokens by one")
-    
-    #input in shape (12, 4, tokens)
-    output = tokens.clone()
-    output = output[:, :, 1:]
-    #print(f"output shape: {output.shape}")
-    return output
 
 def inferenceSentance(model, tokenizer, sentance, device, maxLen=64, initToken=1, endToken=50256, batchSize=4, inferenceParams=None):
     if maxLen == 64:
@@ -482,6 +515,7 @@ def inferenceSentance(model, tokenizer, sentance, device, maxLen=64, initToken=1
     sentance = sentance.lower()
     sentance = sentance + "<|endoftext|>"
     tokens = tokenizer.encode(sentance)
+    tokens.insert(0, initToken)
     tokens = torch.tensor(tokens).unsqueeze(0).to(device)
     inputMask = model.inputMask(tokens)
     inputTensor = torch.tensor(tokens).to(device)
@@ -490,107 +524,161 @@ def inferenceSentance(model, tokenizer, sentance, device, maxLen=64, initToken=1
     #if batchSize > 1 and sourceEncoded.shape[0] == 1:
     #    sourceEncoded = sourceEncoded.repeat(batchSize, 1, 1)
     #    inputMask = inputMask.repeat(batchSize, 1, 1, 1)
-    predictedTokens = [initToken] 
+    
     #print(type(maxLen))
-    for i in range(maxLen - 1):
-        #print(f"iteration {i+1}/{maxLen}")
-       
-        targetTensor = torch.tensor(predictedTokens).unsqueeze(0).to(device)
-        #print(targetTensor)
-        targetMask = model.targetMask(targetTensor)
-        #print(targetMask)
-        #print(targetMask)
-        #print(f"123targetTensor shape: {targetTensor.shape}, sourceEncoded shape: {sourceEncoded.shape}, inputMask shape: {inputMask.shape}, targetMask shape: {targetMask.shape}")
-        #if batchSize > 1 and targetTensor.shape[0] == 1:
-        #    targetMask = targetMask.repeat(batchSize, 1, 1, 1)
-        #    targetTensor = targetTensor.repeat(batchSize, 1)
-        #    #print(f"RESIZING TO BATCH SIZE")
-        #print(f"234targetTensor shape: {targetTensor.shape}, sourceEncoded shape: {sourceEncoded.shape}, inputMask shape: {inputMask.shape}, targetMask shape: {targetMask.shape}")    
-        
-        
-        
-        
-        with torch.no_grad():
-            output, attention = model.decoder(targetTensor, sourceEncoded, input_mask=inputMask, target_mask=targetMask)
-        
-        #get only first batch
-        
-        #print(f"output shape: {output.shape}")
-        #print(output)
-        #output = output[0]
-        #batch size, input length, vocab size
-        
-        #predict the most likely token from the output
-        #remove 0th possible tokens from the 2nd dimension
-        output = output[0, -1, :]
-        #print(output)
-        predictions = np.asarray(output.cpu()).astype('float64')
-        #print(predictions)
-        predictions = np.exp(np.log(predictions) / inferenceParams["temp"])
-        #print(predictions)
-        
-        
-        #temp patch, replace nan with 0.01
-        numThatIsntNan = 0
-        averageProbs = 0
-        
-        for p in predictions:
-            if not math.isnan(p):
-                numThatIsntNan += 1
+    maxRetries = 5
+    for retry in range(maxRetries):
+        predictedTokens = [initToken]
+        print(f"Inference retry: {retry+1}/{maxRetries}")
+        for i in range(maxLen - 1):
+            #print(f"Predicting token {i+1}/{maxLen}", end="")
+            targetTensor = torch.tensor(predictedTokens).unsqueeze(0).to(device)
+            #print(targetTensor)
+            targetMask = model.targetMask(targetTensor)
+            with torch.no_grad():
+                output, attention = model.decoder(targetTensor, sourceEncoded, input_mask=inputMask, target_mask=targetMask)
+            #predict the most likely token from the output
+            #remove 0th possible tokens from the 2nd dimension
+            output = output[0, -1, 1:]
+            output = torch.softmax(output, dim=0)
+            
+            #print(output)
+            #toptwenty = torch.topk(output, 20)
+            #for i in range(len(toptwenty[0])):
+            #    toptwenty[0][i] = toptwenty[0][i] / torch.sum(toptwenty[0])
+            ##print(toptwenty)
+            #formattedTwenty = ""
+            #for i in range(len(toptwenty[0])):
+            #    formattedTwenty += f"{[toptwenty[1][i].item()]}-{tokenizer.decode([toptwenty[1][i].item()])}: {100*toptwenty[0][i].item():0.4f}, "
+            #print(f"Top 20: {formattedTwenty}")
+            
+            #topk = torch.topk(output, inferenceParams["topk"])
+            #print(f"Top {inferenceParams['topk']}: {topk}")
+            
+            #sample from topk
+            
+            #(prob tensor, index tensor)
+            #probList = topk[0].tolist()
+            ##normalize probs
+            #probList = [p / sum(probList) for p in probList]
+            #indexList = topk[1].tolist()
+            
+            #print(f"Prob list: {probList}")
+            #print(f"Index list: {indexList}")
+            #wordlist = ""
+            #for i in indexList:
+            #    try:
+            #        wordlist += f"{tokenizer.decode([i])}, "
+            #    except:
+            #        wordlist += f"{i}, "
+            #print(f"Wordlist: {wordlist}")
+            #
+            ##pick a weighted random index
+            #predicted = np.random.choice(indexList, 1, p=probList)[0]
+            #print(f"Predicted: {predicted}")
+
+            repPenalty = inferenceParams["repPenalty"]
+            prevToken = predictedTokens[-1]
+            #temp sampling
+            predictions = np.asarray(output.cpu()).astype('float64')
+            
+            #apply rep penalty
+            for i in range(len(predictions)):
+                if predictions[i] == prevToken:
+                    predictions[i] = predictions[i] * repPenalty
+                    
+            #apply logit biases list of dictionaries
+            logitBias = inferenceParams["logitBias"]
+            logitBiasObj = {}
+            for i in range(len(logitBias)):
+                tok = logitBias[i][0]
+                probPenalty = logitBias[i][1]
+                logitBiasObj[tok] = probPenalty
                 
-        print(f"numThatIsntNan: {numThatIsntNan}")
-        predictions[np.isnan(predictions)] = 0.01
-        
-        averageProbs = np.sum(predictions[1:]) / len(predictions[1:])
-        print(f"averageProbs: {averageProbs}")
-        
-        #normalize
-        predictions = predictions / np.sum(predictions)
-        probs = torch.from_numpy(predictions).to(device)
-        #print(probs)
-        predicted = torch.multinomial(probs, num_samples=inferenceParams["topk"])
-        print(f"Length of predicted: {len(predicted)}")
-        #remove Nonetype and nan
-        for p in predicted:
-            if p == None or math.isnan(p):
-                predicted.remove(p)
-        
-        
-        predicted = random.choice(predicted)
-        
-        
-        #torch.set_printoptions(threshold=10_000)
-        #print(output[0])
-        
-        #print(predicted)
-        #print(predicted.shape)
-        #predicted = predicted[-1].item()
-        
-        predictedDecodedToken = None
-        try:
-            predictedDecodedToken = tokenizer.decode([predicted])
-            #print(f"predictedDecodedToken: {predictedDecodedToken}")
-        except:
-            print(f"error decoding token")
             
-        if predictedDecodedToken != None:
-            predictedTokens.append(predicted)
-        else:
-            predictedTokens.append(0)
+
+            predictions = np.exp(np.log(predictions) / inferenceParams["temp"])
+            #print(predictions)
+
+            for i in range(len(predictions)):
+                if i in logitBiasObj:
+                    predictions[i] = predictions[i] * logitBiasObj[i]
+
+            #temp patch, replace nan with 0.01
+            numThatIsntNan = 0
+            averageProbs = 0
+
+            for p in predictions:
+                if not math.isnan(p):
+                    numThatIsntNan += 1
+
+            predictions[np.isnan(predictions)] = 0.00
+
+            #averageProbs = np.sum(predictions) / len(predictions)
+
+            ##normalize
+            predictions = predictions / np.sum(predictions)
+            probs = torch.from_numpy(predictions)
+            #predicted = torch.multinomial(probs, num_samples=inferenceParams["topk"])
+            #remove Nonetype and nan
+            #for p in predicted:
+            #    if p == None or math.isnan(p):
+            #        predicted.remove(p)
+
+            predicted = np.random.choice(len(probs), p=probs)
+            ##predicted = np.random.choice(predicted, 1, p=predictions)
+            #predicted = predicted[-1].item()
+            ##print(predicted, end="")
+            
+            #print top 10 debug
+            #topk = torch.topk(probs, 10)
+            #stringToPrint = ""
+            #for i in range(len(topk[0])):
+            #    topk[0][i] = topk[0][i] / torch.sum(topk[0])
+            #
+            #print(f"Top 10: {topk[0]} {topk[1]}")
+            #for i in range(len(topk[0])):
+            #    index = topk[1][i].item()
+            #    prob = topk[0][i].item()
+            #    if index == None:
+            #        continue
+            #    try:
+            #        word = tokenizer.decode(index)
+            #    except:
+            #        word = "err"
+            #    stringToPrint += f"{index}-{word}: {prob:0.4f}, "
+            #print(f"Top 10: {stringToPrint}")
+            
+
+
+            predictedDecodedToken = None
+            try:
+                predictedDecodedToken = tokenizer.decode([predicted])
+                print(predictedDecodedToken, end="")
+            except:
+                print(f"error decoding token")
+                pass
+
+            if predictedDecodedToken != None:
+                predictedTokens.append(predicted)
+            else:
+                predictedTokens.append(0)
+
+
+            if predicted == endToken or predictedDecodedToken == inferenceParams["eos"]:
+                break 
             
             
-        if predicted == endToken or predictedDecodedToken == inferenceParams["eos"]:
-            break 
-        
-        
-        if i % 32 == 0:
-            
-            predictedSentance = tokenizer.decode(predictedTokens)
-            predictedSentance = cleanNonReadableText(predictedSentance)
-            print(f"Output: {predictedSentance}")
+            #if i % 32 == 0:
+#
+            #    predictedSentance = tokenizer.decode(predictedTokens)
+            #    predictedSentance = cleanNonReadableText(predictedSentance)
+            #    print(f"Output: {predictedSentance}")
+        if len(predictedTokens) >= inferenceParams["minLen"]:
+            print(f"\nLength of predicted tokens: {len(predictedTokens)}, greater than minLen: {inferenceParams['minLen']}")
+            break
     predictedSentance = tokenizer.decode(predictedTokens)
     predictedSentance = cleanNonReadableText(predictedSentance)
-    print(f"Final output: {predictedSentance}")
     return predictedSentance, attention
 
 #borrowed
@@ -622,16 +710,68 @@ def display_attention(sentence, translation, attention, n_heads = 4, n_rows = 1,
     plt.close()
     
 def cleanNonReadableText(text):
-    cleanText = text.encode('ascii', 'ignore').decode('ascii')
+    cleanText = text.strip()
+    cleanText = unidecode(cleanText)
+    for c in cleanText:
+        if c not in " abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,?!'\"<>|[]{}()":
+            cleanText = cleanText.replace(c, "")
     cleanText = cleanText.replace("<|endoftext|>", "")
-    return text
+    cleanText = cleanText.replace("<|startoftext|>", "")
+    cleanText = cleanText.replace("�", "")
+    #capitalize the first letter
+    cleanText = cleanText.strip()
+    cleanText = cleanText[0].upper() + cleanText[1:]
+    return cleanText
+
+def calcBLEU(inferenceresults):
+    #inferenceresults is a list of lists of [predicted, truth]
+    #calculate the BLEU score
+    #https://machinelearningmastery.com/calculate-bleu-score-for-text-python/
+    references = []
+    candidates = []
+    for result in inferenceresults:
+        references.append(result[1])
+        candidates.append(result[0])
+    score = corpus_bleu(references, candidates)
+    print(f"BLEU score: {score}")
+    return score
 
 
+
+def calcBLEUWrapper(model, dataset_en, dataset_de, inferenceParams, device):
+    tokenizer = Tokenizer()
+    infResults = []
+    for i in range(len(dataset_en)):
+        print(f"Calculating BLEU for {i+1}/{len(dataset_en)}")
+        osentence = tokenizer.decode(dataset_en[i][0])
+        desentance = tokenizer.decode(dataset_de[i][0])
+        translation, attention = inferenceSentance(
+        model=model, tokenizer=tokenizer, sentance=osentence, device=device, maxLen=inferenceParams["maxLen"], inferenceParams=inferenceParams)
+        translation = cleanNonReadableText(translation)
+        
+        #split into list of words
+        translation = translation.split()
+        desentance = desentance.split()
+        print(f"Length of translation: {len(translation)}, length of desentance: {len(desentance)}")
+        infResults.append([translation, desentance])
+        
+    return calcBLEU(infResults)
+
+def writePickle(obj, filename):
+    root = 'picklejar'
+    if not os.path.exists(root):
+        os.makedirs(root)
+        
+    filename = os.path.join(root, filename)
+    with open(filename, 'wb') as f:
+        pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
+        
+    
 
 def main():
     print(f"Running Preinit")
     device = preinit()
-    PAD_TOKEN = 2
+    PAD_TOKEN = 50256
     EOS_TOKEN = 50256
     INIT_TOKEN = 1
     model = None
@@ -642,52 +782,66 @@ def main():
     
     trainPairs= loadDatasets(True)
     #only use 50 pairs for now
-    trainPairs = trainPairs[:12*8]
+    trainPairs = trainPairs[:24*8]
     print(f"Loaded {len(trainPairs)} pairs")
     
-    
-    
+    global DO_IMPROVED_SELF_ATTENTION
+    DO_IMPROVED_SELF_ATTENTION = False
     hidden_dim = 512
     num_layers = 6
     dropoutEncoder = 0.1
     dropoutDecoder = 0.1
     num_heads = 8
     BATCH_SIZE = 8
-    NUM_EPOCHS = 2
+    NUM_EPOCHS = 10
+    TrainTestFraction = 0.4
     tokenizer = Tokenizer()
     trainPairs = AddInitEOSTokensToDataset(trainPairs, tokenizer, initToken=INIT_TOKEN, endToken=EOS_TOKEN)
     
     batch_en, batch_de = DatasetToTokens(trainPairs, tokenizer, batch_size=BATCH_SIZE)
-    batch_de = shiftTokensByOne(batch_de)
     
-    batch_en_test, batch_en_train = batch_en[:len(batch_en)//2], batch_en[len(batch_en)//2:]
-    batch_de_test, batch_de_train = batch_de[:len(batch_de)//2], batch_de[len(batch_de)//2:]
-    
+    batch_en_test, batch_en_train = batch_en[:math.floor(len(batch_en) * TrainTestFraction)], batch_en[math.floor(len(batch_en) * TrainTestFraction):]
+    batch_de_test, batch_de_train = batch_de[:math.floor(len(batch_de) * TrainTestFraction)], batch_de[math.floor(len(batch_de) * TrainTestFraction):]
+    print(f"Train has a length of {len(batch_en_train)} batches, test has a length of {len(batch_en_test)} batches")
     vocab_en, vocab_de, tokenizedvocab_en, tokenizedvocab_de = countVocab(trainPairs, tokenizer)
     DumpVocabToJSON(vocab_en, "vocab_en.json")
     DumpVocabToJSON(vocab_de, "vocab_de.json")
     DumpVocabToJSON(tokenizedvocab_en, "tokenizedvocab_en.json")
     DumpVocabToJSON(tokenizedvocab_de, "tokenizedvocab_de.json")
     print(f"There are {len(batch_en)} batches in the training set")
-    print(batch_en.shape)
+    #print(batch_en.shape)
     input_dim = len(vocab_en)
     output_dim = len(vocab_de)
     
     
     
     #test
-    LR = 0.001
+    LR = 0.0005
     testPhrase = "Hello, my name is John. My favorite place in the world is the beach."
+    truthPhrase = translated = GoogleTranslator(source='auto', target='de').translate(testPhrase)
     tokensTestPhrase = tokenizer.encode(testPhrase)
-    print(tokensTestPhrase)
+    #print(tokensTestPhrase)
     
     #inference params
     maxLen = 64
     temp = 0.7
-    topk = 8
-    InferenceParams =  {"maxLen": maxLen, "temp": temp, "topk": topk, "eos": tokenizer.decode([EOS_TOKEN])}
+    topk = 12
+    logitBiases = list()
+    logitBiases.append((9971, 0.2))
+    logitBiases.append((4582, 0.2))
+    logitBiases.append((4861, 0.2))
+    logitBiases.append((5745, 0.2))
+    logitBiases.append((4655, 0.2))
+    logitBiases.append((2149, 0.2))
+    InferenceParams =  {"maxLen": maxLen, "temp": temp, "topk": topk, "eos": tokenizer.decode([EOS_TOKEN]),
+                        "init": tokenizer.decode([INIT_TOKEN]), "pad": tokenizer.decode([PAD_TOKEN]),"minLen": 10,
+                        "repPenalty": 0.2, "logitBias": logitBiases}
     
-    
+    #tracking
+    lossByEpoch = []
+    timeTrainingByEpoch = []
+    inferenceResultsByEpoch = []
+    totalTimeStart = time.time()
     if InferenceOnly:
         #load model.pt instead of training
         model = torch.load(LoadModelPath)
@@ -699,8 +853,20 @@ def main():
         model = AttentionTransformer(encoder, decoder, device)
         optimizer = torch.optim.Adam(model.parameters(), lr=LR)
         criterion = torch.nn.CrossEntropyLoss(ignore_index=PAD_TOKEN)
+        
         print(f"Model has {params(model)} parameters")
         model.apply(initWeights)
+        #inference once at beginning
+        translation, attention = inferenceSentance(
+        model=model, tokenizer=tokenizer, sentance=testPhrase, device=device, maxLen=maxLen, inferenceParams=InferenceParams)
+        print(f"--Starting INFERENCE--")
+        print(f"Input: {testPhrase}")
+        print(f"Output: {translation}")
+        translation = cleanNonReadableText(translation)
+        print(f"Cleaned Output: {translation}")
+        print(f"Truth: {truthPhrase}")
+        inferenceResultsByEpoch.append([translation, truthPhrase])
+        print(f"----------------")
         for epoch in range(NUM_EPOCHS):
             print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
             start = time.time()
@@ -711,23 +877,57 @@ def main():
             print(f"Epoch took {end-start} seconds")
             translation, attention = inferenceSentance(
         model=model, tokenizer=tokenizer, sentance=testPhrase, device=device, maxLen=maxLen, inferenceParams=InferenceParams)
+            print(f"--INFERENCE--")
             print(f"Input: {testPhrase}")
             print(f"Output: {translation}")
+            translation = cleanNonReadableText(translation)
+            print(f"Cleaned Output: {translation}")
+            print(f"Truth: {truthPhrase}")
+            inferenceResultsByEpoch.append([translation, truthPhrase])
+            print(f"----------------")
+            
+            #save model every 5 epochs
+            if epoch % 5 == 0:
+                torch.save(model.state_dict(), SaveModelPath + f"_{epoch}.pt")
+                print("Model saved")
         
+            #save tracking
+            lossByEpoch.append([train_loss, test_loss])
+            timeTrainingByEpoch.append(end-start)
+        
+            
         #save the model
         if SaveModel:
             torch.save(model.state_dict(), SaveModelPath)
             print("Model saved")
         print(f"Train Loss: {train_loss}, Test Loss: {test_loss}")
         print(f"Took {end-start} seconds")
-    
+        
+        #save results pickle
+        writePickle(lossByEpoch, "lossByEpoch.pickle")
+        writePickle(timeTrainingByEpoch, "timeTrainingByEpoch.pickle")
+        writePickle(inferenceResultsByEpoch, "inferenceResultsByEpoch.pickle")
+    totalTimeEnd = time.time()
     #run final inference
     translation, attention = inferenceSentance(
         model=model, tokenizer=tokenizer, sentance=testPhrase, device=device, maxLen=maxLen, inferenceParams=InferenceParams)
-    translation = cleanNonReadableText(translation)
+    
+    print(f"--FINAL INFERENCE--")
     print(f"Input: {testPhrase}")
     print(f"Output: {translation}")
-    #display_attention(testPhrase, translation, attention)
+    translation = cleanNonReadableText(translation)
+    print(f"Cleaned Output: {translation}")
+    print(f"Truth: {truthPhrase}")
+    print(f"----------------")
+    print(f"Params of model: {params(model)}")
+    print(f"Time Taken: {totalTimeEnd - totalTimeStart}")
+    
+    bleu = calcBLEUWrapper(model, batch_en_test, batch_de_test, InferenceParams, device)
+    print(f"BLEU score: {bleu}")
+    
+    #pickle time taken
+    writePickle(totalTimeEnd - totalTimeStart, "totalTime.pickle")
+    writePickle(bleu, "bleu.pickle")
 
 
 if __name__ == '__main__':

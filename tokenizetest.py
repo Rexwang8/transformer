@@ -11,7 +11,7 @@ import sys
 tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 
 # string
-string = "<|startoftext|>"
+string = "disco"
 # tokenize
 tokenized_string = tokenizer.encode(string)
 print(tokenized_string)
