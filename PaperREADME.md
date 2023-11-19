@@ -28,7 +28,7 @@ Except for main.py, all other helper files are 100% written by Rex Wang
 
 # Datasets
 
-The Flores 200 dataset was used for this project. It was obtained on their public site found here:
+The Flores 200 dataset was used for this project. It is a translation dataset that includes 2000 sentances of the same content in a variety of languages. It was obtained on their public site found here:
 
 https://github.com/facebookresearch/flores/blob/main/flores200/README.md
 
